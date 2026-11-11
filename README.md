@@ -13,10 +13,16 @@ Funciona sobre Google Sheets y Google Apps Script: no requiere servidor propio n
 - Funciona sin señal: guarda lo marcado en el celular y lo envía al volver la conexión.
 - Coberturas por franco o vacaciones con la columna *También ve a*.
 
+**Panel web de RR. HH. (`/exec?vista=rrhh`)**
+- Acceso solo para las analistas cargadas en la pestaña `Analistas` (email y PIN). Sus sesiones no sirven para tomar asistencia, y las de los supervisores no abren el panel.
+- Resumen del día con totales, por área y sub área, por supervisor, ausentes, horas extra, sin registrar y contradicciones.
+- Listados por período (por colaborador, detalle, solo ausentes, solo HHEE) con filtros, vista previa, descarga en Excel y envío al mail registrado de la analista.
+
 **Hoja de cálculo (RR. HH.)**
 - `Asistencia`: una fila por registro (fecha, turno, legajo, estado, HHEE, observación, supervisor, hora, tarea).
 - `Resumen`: totales, por área y sub área, por supervisor, ausentes, horas extra, sin registrar y dobles registros. Se actualiza cada 10 minutos.
 - Reporte por mail a demanda o automático a una hora fija.
+- `Listados`: listados por período (por colaborador, detalle, solo ausentes, solo HHEE) con filtros por turno, área, sub área, tarea y supervisor. Se exportan a Excel en la carpeta *Listados de asistencia* de Drive y se envían por mail, adjuntos o como link.
 
 ## Estructura
 
@@ -24,13 +30,14 @@ Funciona sobre Google Sheets y Google Apps Script: no requiere servidor propio n
 src/
   Code.gs          Lógica del lado de Google: hojas, PIN, lectura, guardado, resumen y mail
   Index.html       Página que usan los supervisores
+  Panel.html       Panel web de RR. HH. (misma URL con ?vista=rrhh)
   appsscript.json  Manifiesto del proyecto (zona horaria y configuración de la app web)
 ```
 
 ## Instalación
 
 1. Crear una hoja de cálculo de Google y, en **Archivo > Configuración**, poner configuración regional Argentina y zona horaria Buenos Aires.
-2. Abrir **Extensiones > Apps Script**. Reemplazar el contenido de `Código.gs` por `src/Code.gs` y crear un archivo HTML llamado exactamente `Index` con el contenido de `src/Index.html`.
+2. Abrir **Extensiones > Apps Script**. Reemplazar el contenido de `Código.gs` por `src/Code.gs` y crear dos archivos HTML llamados exactamente `Index` y `Panel` con el contenido de `src/Index.html` y `src/Panel.html`.
 3. En el desplegable de funciones elegir **configurar** (por defecto aparece `doGet`) y ejecutarla. Aceptar los permisos.
 4. Cargar las pestañas `Padrón` y `Supervisores`.
 5. **Implementar > Nueva implementación > Aplicación web**, con *Ejecutar como: Yo* y *Quién tiene acceso: Cualquier usuario*. Repartir la URL que termina en `/exec`.
@@ -45,6 +52,11 @@ src/
 **Supervisores**
 
 | Nombre | PIN | Activo | También ve a |
+| --- | --- | --- | --- |
+
+**Analistas** (acceso al panel de RR. HH.)
+
+| Nombre | Email | PIN | Activo |
 | --- | --- | --- | --- |
 
 **Resumen**, fila 1: `B1` fecha, `E1` turno, `K1` correos para el reporte, `N1` hora del envío automático.
@@ -68,4 +80,6 @@ clasp push
 
 - Este repositorio contiene solo código. El padrón, los PIN y los registros quedan en la hoja de cálculo, que no debe compartirse fuera de RR. HH.
 - No subir al repositorio la URL de la aplicación web, exportaciones del padrón ni el archivo `.clasp.json`.
-- Tras 5 intentos de PIN incorrectos, el supervisor queda bloqueado 10 minutos.
+- El celular guarda un token de sesión, no el PIN. La sesión vence a los 60 días o cuando RR. HH. cambia el PIN o desactiva al supervisor.
+- Tras 5 intentos de PIN incorrectos, ese supervisor no puede volver a ingresar durante 10 minutos (las sesiones ya abiertas siguen funcionando).
+- Los textos que empiezan con = + - @ se guardan como texto, nunca como fórmula.

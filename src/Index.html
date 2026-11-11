@@ -249,7 +249,6 @@ function registrosDelDia(){
   return m;
 }
 function estadoDe(m,leg,turno){const arr=m.get(turno+"|"+leg)||[];const mio=arr.find(x=>x.sup===yo());return{mio:mio||null,ver:mio||arr[0]||null,cant:arr.length};}
-function areas(){return Array.from(new Set(S.padron.map(p=>p[2]).filter(Boolean))).sort((a,b)=>a.localeCompare(b,"es"));}
 function esMio(p){const r=norm(p[5]);return!!r&&S.cubre.some(c=>norm(c)===r);}
 function unicos(xs){return Array.from(new Set(xs.filter(Boolean))).sort((a,b)=>a.localeCompare(b,"es"));}
 function filtroSel(id,opts,valor,todos){
@@ -273,10 +272,6 @@ function armarFiltros(){
 }
 function enTurno(p,turno){return!p[4]||p[4]===turno;}
 function nombreSup(s){return s===yo()?"vos":(s||"otro supervisor");}
-function llenarSelect(sel,opts,valor,todos){
-  sel.innerHTML=['<option value="">'+esc(todos)+"</option>"].concat(opts.map(o=>'<option value="'+esc(o)+'">'+esc(o)+"</option>")).join("");
-  sel.value=opts.includes(valor)?valor:"";return sel.value;
-}
 
 /* ---------- vista supervisor ---------- */
 function focoEnPanel(){const a=document.activeElement;return a&&a.closest&&a.closest(".panel")&&a.matches("textarea,input");}
@@ -382,7 +377,7 @@ function aplicarAServidor(op){
 function marcar(e){
   const d=S.draft;if(!d)return;
   const ob=$("#obs");if(ob)d.o=ob.value;const nn=$("#nom-nuevo");if(nn)d.n=nn.value;
-  const h=e==="P"?Math.max(0,Math.min(16,Math.round((+d.h||0)*10)/10)):0;
+  const h=e==="P"?Math.max(0,Math.min(12,Math.round((+d.h||0)*10)/10)):0;
   const leg=d.leg;const habiaBusqueda=!!S.q;
   S.abierto=null;S.draft=null;
   if(document.activeElement)document.activeElement.blur();
@@ -433,12 +428,13 @@ async function ingresar(){
   const b=$("#lg-btn");b.disabled=true;b.textContent="Ingresando";$("#lg-err").textContent="";
   try{
     const r=await api("ingresar",{nombre,pin});
-    S.cred={nombre:r.nombre,pin};escribirLS("asis.cred",S.cred);escribirLS("asis.ultimoNombre",r.nombre);
+    S.cred={nombre:r.nombre,token:r.token};escribirLS("asis.cred",S.cred);escribirLS("asis.ultimoNombre",r.nombre);
     $("#lg-pin").value="";render();refrescar();enviar();
   }catch(e){$("#lg-err").textContent=esSesion(e)?msgError(e):"No se pudo conectar. Revisá la señal.";}
   finally{b.disabled=false;b.textContent="Ingresar";}
 }
 function cerrarSesion(msg){
+  if(S.cred&&S.cred.token){const c=S.cred;api("salir",c).catch(()=>{});}
   S.cred=null;try{localStorage.removeItem("asis.cred");}catch(e){}
   S.abierto=null;S.draft=null;mostrarLogin(msg);
 }
@@ -500,7 +496,7 @@ $("#lista").addEventListener("input",e=>{
   else if(e.target.id==="nom-nuevo")S.draft.n=e.target.value;
   else if(e.target.id==="hh-in"){const v=parseFloat(String(e.target.value).replace(",","."));S.draft.h=isFinite(v)&&v>0?v:0;$$("#lista .hh .chip").forEach(c=>c.setAttribute("aria-pressed",String(+c.dataset.v===S.draft.h)));}
 });
-$("#lista").addEventListener("focusout",()=>{setTimeout(()=>{if(S.rerender&&!focoEnPanel())renderSup();},0);});
+$("#lista").addEventListener("focusout",()=>{setTimeout(()=>{if(S.rerender&&!focoEnPanel())renderSup();},350);});
 window.addEventListener("online",()=>{S.sinConexion=false;enviar();refrescar();});
 window.addEventListener("offline",()=>{S.sinConexion=true;render();});
 document.addEventListener("visibilitychange",()=>{if(document.visibilityState==="visible"){enviar();refrescar();}});
@@ -508,7 +504,13 @@ setInterval(()=>{if(document.visibilityState==="visible")refrescar();},30000);
 setInterval(enviar,15000);
 
 /* ---------- inicio ---------- */
-if(S.cred){render();refrescar();enviar();}else mostrarLogin("");
+async function migrarCred(){
+  if(!S.cred||S.cred.token||!S.cred.pin)return true;
+  try{const r=await api("ingresar",{nombre:S.cred.nombre,pin:S.cred.pin});S.cred={nombre:r.nombre,token:r.token};escribirLS("asis.cred",S.cred);}
+  catch(e){if(esSesion(e)){cerrarSesion(msgError(e));return false;}}
+  return true;
+}
+if(S.cred){render();migrarCred().then(ok=>{if(ok&&S.cred){refrescar();enviar();}});}else mostrarLogin("");
 })();
 </script>
 </body>

@@ -9,11 +9,14 @@
  *   Asistencia    la completa la aplicación (no editar a mano mientras se usa)
  *   Resumen       totales del día por área y sub área (elegir fecha en B1 y turno en E1)
  *                 K1: correos para el reporte (separados por coma); N1: hora del envío automático o No
+ *   Analistas     Nombre | Email | PIN | Activo: acceso al panel web de RR. HH. (link de la app + ?vista=rrhh)
+ *   Listados      listados por período (detalle, por colaborador, ausentes, HHEE) para exportar y mandar por mail
  *
  * Primera vez: ejecutar la función configurar() desde el editor.
  */
 
 const TZ = 'America/Argentina/Buenos_Aires';
+const HHEE_MAX = 12;
 const H_PADRON = 'Padrón';
 const H_SUP = 'Supervisores';
 const H_ASIS = 'Asistencia';
@@ -22,9 +25,10 @@ const COLS_ASIS = ['ID', 'Fecha', 'Turno', 'Legajo', 'Apellido y nombre', 'Área
 
 /* ---------------- Página ---------------- */
 
-function doGet() {
-  return HtmlService.createHtmlOutputFromFile('Index')
-    .setTitle('Asistencia en puesto')
+function doGet(e) {
+  const rrhh = e && e.parameter && e.parameter.vista === 'rrhh';
+  return HtmlService.createHtmlOutputFromFile(rrhh ? 'Panel' : 'Index')
+    .setTitle(rrhh ? 'Panel RR. HH.' : 'Asistencia en puesto')
     .addMetaTag('viewport', 'width=device-width, initial-scale=1, viewport-fit=cover');
 }
 
@@ -67,6 +71,10 @@ function configurar() {
     ScriptApp.newTrigger('envioAutomatico').timeBased().everyHours(1).create();
   }
   prepararEnvio_(hojaResumen_(ss));
+  prepararListados_(ss);
+  const an = hoja_(ss, H_ANA, ['Nombre', 'Email', 'PIN', 'Activo']);
+  an.getRange('C:C').setNumberFormat('@');
+  if (an.getLastRow() < 2) an.getRange(2, 1, 1, 4).setValues([['Analista de ejemplo', 'analista@ejemplo.com', '5678', 'NO']]);
   actualizarResumen();
   ss.toast('Hojas listas. El resumen se actualiza solo cada 10 minutos.', 'Asistencia', 6);
 }
@@ -95,7 +103,26 @@ function listarSupervisores() {
   return supervisores_().map(s => s.nombre).sort((a, b) => a.localeCompare(b, 'es'));
 }
 
+const DIAS_SESION = 60;
+
+// Acepta la sesión (token) o, para celulares con la versión anterior, nombre y PIN.
+// Devuelve el supervisor: { nombre, pin, tambien }.
 function validar_(cred) {
+  if (cred && cred.token) {
+    const raw = PropertiesService.getScriptProperties().getProperty('ses_' + cred.token);
+    if (!raw) throw new Error('SESION: Tu sesión venció. Ingresá de nuevo con tu PIN.');
+    const ses = JSON.parse(raw);
+    if (ses.r === 'rrhh') throw new Error('SESION: Ingresá con tu usuario de supervisor.');
+    const s = supervisores_().find(x => x.nombre === ses.n);
+    if (!s) throw new Error('SESION: Ese supervisor no está habilitado.');
+    if (hash_([s.nombre, s.pin]) !== ses.h) throw new Error('SESION: Tu PIN cambió. Ingresá de nuevo.');
+    if (Date.now() - ses.c > DIAS_SESION * 864e5) throw new Error('SESION: Tu sesión venció. Ingresá de nuevo con tu PIN.');
+    return s;
+  }
+  return validarPin_(cred);
+}
+
+function validarPin_(cred) {
   if (!cred || !cred.nombre) throw new Error('SESION: Ingresá con tu nombre y PIN.');
   const cache = CacheService.getScriptCache();
   const k = 'fallos_' + Utilities.base64EncodeWebSafe(String(cred.nombre)).slice(0, 200);
@@ -107,11 +134,32 @@ function validar_(cred) {
     throw new Error(s ? 'SESION: PIN incorrecto.' : 'SESION: Ese supervisor no está habilitado.');
   }
   cache.remove(k);
-  return s.nombre;
+  return s;
 }
 
+// Con el PIN correcto entrega un token de sesión: el celular guarda el token, nunca el PIN.
+// Si RR. HH. cambia el PIN o desactiva al supervisor, la sesión deja de valer.
 function ingresar(cred) {
-  return { nombre: validar_(cred) };
+  const s = validarPin_(cred);
+  const props = PropertiesService.getScriptProperties();
+  limpiarSesiones_(props);
+  const token = Utilities.getUuid();
+  props.setProperty('ses_' + token, JSON.stringify({ n: s.nombre, h: hash_([s.nombre, s.pin]), c: Date.now() }));
+  return { nombre: s.nombre, token: token };
+}
+
+function salir(cred) {
+  if (cred && cred.token) PropertiesService.getScriptProperties().deleteProperty('ses_' + cred.token);
+  return true;
+}
+
+function limpiarSesiones_(props) {
+  const todas = props.getProperties();
+  Object.keys(todas).forEach(k => {
+    if (k.indexOf('ses_') !== 0) return;
+    try { if (Date.now() - JSON.parse(todas[k]).c > DIAS_SESION * 864e5) props.deleteProperty(k); }
+    catch (e) { props.deleteProperty(k); }
+  });
 }
 
 /* ---------------- Padrón ---------------- */
@@ -158,12 +206,12 @@ function hash_(o) {
 /* ---------------- Lectura del día ---------------- */
 
 function datosDelDia(cred, fecha, hashPadron) {
-  const yo = validar_(cred);
+  const sup = validar_(cred);
+  const yo = sup.nombre;
   if (!/^\d{4}-\d{2}-\d{2}$/.test(fecha)) throw new Error('Fecha no válida.');
   const pad = padron_();
   const hp = hash_(pad);
-  const sup = supervisores_().find(x => x.nombre === yo);
-  const tambien = sup && sup.tambien ? sup.tambien.split(/[,;]/).map(x => x.trim()).filter(Boolean) : [];
+  const tambien = sup.tambien ? sup.tambien.split(/[,;]/).map(x => x.trim()).filter(Boolean) : [];
   return {
     yo: yo,
     cubre: [yo].concat(tambien),
@@ -180,16 +228,22 @@ function registrosDe_(fecha) {
   const hallados = h.getRange(2, 1, h.getLastRow() - 1, 1)
     .createTextFinder(fecha + '|').matchCase(true).findAll();
   if (!hallados.length) return [];
-  let min = Infinity, max = 0;
-  hallados.forEach(r => { min = Math.min(min, r.getRow()); max = Math.max(max, r.getRow()); });
-  const vals = h.getRange(min, 1, max - min + 1, COLS_ASIS.length).getDisplayValues();
+  // Agrupa las filas en tramos cercanos, para no leer miles de filas de otros días
+  const filas = hallados.map(r => r.getRow()).sort((a, b) => a - b);
+  const tramos = [];
+  filas.forEach(f => {
+    const u = tramos[tramos.length - 1];
+    if (u && f - u[1] <= 20) u[1] = f; else tramos.push([f, f]);
+  });
+  let vals = [];
+  tramos.forEach(t => { vals = vals.concat(h.getRange(t[0], 1, t[1] - t[0] + 1, COLS_ASIS.length).getDisplayValues()); });
   return vals.filter(r => r[0].indexOf(fecha + '|') === 0).map(r => {
     const id = r[0].split('|');
     return {
       leg: id[2], turno: id[1], sup: r[10],
       e: r[7] === 'Ausente' ? 'A' : 'P',
       h: Number(String(r[8]).replace(',', '.')) || 0,
-      o: r[9], t: r[11], n: '',
+      o: r[9], t: r[11], n: r[4] === '(fuera del padrón)' ? '' : r[4],
       nom: r[4], area: r[5], sub: r[6]
     };
   });
@@ -198,7 +252,7 @@ function registrosDe_(fecha) {
 /* ---------------- Guardado ---------------- */
 
 function guardarLote(cred, ops) {
-  const yo = validar_(cred);
+  const yo = validar_(cred).nombre;
   if (!Array.isArray(ops) || !ops.length) return { ok: [] };
 
   const lock = LockService.getScriptLock();
@@ -230,18 +284,18 @@ function guardarLote(cred, ops) {
 
       const p = pmap.get(String(op.leg));
       const f = op.fecha.split('-').map(Number);
-      const hhee = op.e === 'P' ? Math.max(0, Math.min(16, Number(op.h) || 0)) : 0;
+      const hhee = op.e === 'P' ? Math.max(0, Math.min(HHEE_MAX, Number(op.h) || 0)) : 0;
       const valores = [
         id,
         new Date(Date.UTC(f[0], f[1] - 1, f[2], 15)),
         op.turno,
         /^\d+$/.test(op.leg) ? Number(op.leg) : op.leg,
-        p ? p[1] : (String(op.n || '').slice(0, 80) || '(fuera del padrón)'),
+        p ? p[1] : (textoSeguro_(op.n, 80) || '(fuera del padrón)'),
         p ? p[2] : '',
         p ? p[3] : '',
         op.e === 'A' ? 'Ausente' : 'Presente',
         hhee || '',
-        String(op.o || '').slice(0, 300),
+        textoSeguro_(op.o, 300),
         yo,
         op.t ? Utilities.formatDate(new Date(op.t), TZ, 'HH:mm') : '',
         ahora,
@@ -259,6 +313,16 @@ function guardarLote(cred, ops) {
   } finally {
     lock.releaseLock();
   }
+}
+
+function celdaSegura_(v) {
+  return typeof v === 'string' && /^[=+\-@]/.test(v) ? "'" + v : v;
+}
+
+// Un texto que empieza con = + - @ se guarda como texto, no como fórmula
+function textoSeguro_(s, max) {
+  const txt = String(s || '').trim().slice(0, max);
+  return /^[=+\-@]/.test(txt) ? "'" + txt : txt;
 }
 
 function buscarFila_(h, id) {
@@ -280,6 +344,9 @@ function onOpen() {
     .addItem('Actualizar resumen', 'actualizarResumen')
     .addSeparator()
     .addItem('Enviar reporte por mail', 'enviarReportePorMail')
+    .addSeparator()
+    .addItem('Generar listado', 'generarListado')
+    .addItem('Enviar listado por mail', 'enviarListadoPorMail')
     .addToUi();
 }
 
@@ -329,7 +396,15 @@ function hojaResumen_(ss) {
   return h;
 }
 
+// Evita que el activador, un cambio de fecha y el envío por mail escriban el Resumen al mismo tiempo
 function actualizarResumen() {
+  let lock = null;
+  try { lock = LockService.getDocumentLock(); } catch (e) { lock = null; }
+  if (lock && !lock.tryLock(20000)) return null;
+  try { return actualizarResumen_(); } finally { if (lock) lock.releaseLock(); }
+}
+
+function actualizarResumen_() {
   const ss = SpreadsheetApp.getActive();
   const h = hojaResumen_(ss);
 
@@ -342,6 +417,39 @@ function actualizarResumen() {
   const tSel = String(h.getRange('E1').getValue());
   const turno = /^(TM|TT)$/.test(tSel) ? tSel : 'Ambos';
 
+  const d = calcularResumen_(fecha, turno);
+  const t = d.t, totHs = d.totHs, titFecha = d.titFecha, filasArea = d.filasArea, negritas = d.negritas,
+    filasSup = d.filasSup, ausentes = d.ausentes, hhee = d.hhee, filasSin = d.filasSin, dobles = d.dobles;
+
+  // Escribir
+  h.getRange(2, 1, Math.max(h.getMaxRows() - 1, 1), h.getMaxColumns()).clear();
+  let r = 3;
+  r = bloque_(h, r, 'Totales del ' + titFecha,
+    ['Dotación', 'Presentes', 'Ausentes', 'Sin registrar', '% presentismo', '% ausentismo', 'HHEE (hs)', 'Dobles registros'],
+    [[t.d, t.p, t.a, t.s, t.d ? t.p / t.d : '', t.d ? t.a / t.d : '', totHs, dobles.length]],
+    { pct: [5, 6], dec: [7] });
+  r = bloque_(h, r, 'Por área y sub área',
+    ['Área', 'Sub área', 'Dotación', 'Presentes', 'Ausentes', 'Sin registrar', '% presentismo', 'HHEE (hs)'],
+    filasArea, { pct: [7], dec: [8], negritas: negritas });
+  r = bloque_(h, r, 'Por supervisor',
+    ['Supervisor', 'Dotación', 'Presentes', 'Ausentes', 'Sin registrar', '% presentismo', 'HHEE (hs)'],
+    filasSup, { pct: [6], dec: [7] });
+  r = bloque_(h, r, 'Ausentes (' + ausentes.length + ')',
+    ['Legajo', 'Apellido y nombre', 'Área', 'Sub área', 'Turno', 'Observación', 'Supervisor', 'Tarea'], ausentes, {});
+  r = bloque_(h, r, 'Horas extra (' + String(Math.round(totHs * 10) / 10).replace('.', ',') + ' hs)',
+    ['Legajo', 'Apellido y nombre', 'Área', 'Sub área', 'Turno', 'Observación', 'Supervisor', 'HHEE (hs)'], hhee, { dec: [8] });
+  r = bloque_(h, r, 'Sin registrar (' + filasSin.length + ')',
+    ['Legajo', 'Apellido y nombre', 'Área', 'Sub área', 'Turno en padrón', 'Reporta a', 'Tarea'], filasSin, {});
+  if (dobles.length) {
+    r = bloque_(h, r, 'Dobles registros o contradictorios (' + dobles.length + ')',
+      ['Legajo', 'Apellido y nombre', 'Área', 'Sub área', 'Turno', 'Estados', 'Supervisores'], dobles, {});
+  }
+  h.getRange('H1').setValue(new Date()).setNumberFormat('dd/mm/yyyy hh:mm');
+  return d;
+}
+
+// Cálculo del resumen de un día (fecha yyyy-MM-dd, turno TM/TT/Ambos). Lo usan la hoja Resumen, el mail y el panel.
+function calcularResumen_(fecha, turno) {
   const pad = padron_();
   const pmap = new Map(pad.map(p => [p[0], p]));
   const regs = registrosDe_(fecha).filter(r => turno === 'Ambos' || r.turno === turno);
@@ -368,9 +476,17 @@ function actualizarResumen() {
     lista.filter(r => r.e === 'P' && r.h > 0).forEach(r => hhee.push([num_(leg), nom, area, sub, r.turno, r.o, r.sup, r.h]));
     turnos.forEach(t => {
       const del = lista.filter(r => r.turno === t);
-      if (del.length > 1) dobles.push([num_(leg), nom, area, sub, t,
-        del.map(r => r.e === 'P' ? 'Presente' : 'Ausente').join(' / '), del.map(r => r.sup).join(' / ')]);
+      if (del.length > 1) {
+        dobles.push([num_(leg), nom, area, sub, t,
+          del.map(r => r.e === 'P' ? 'Presente' : 'Ausente').join(' / '), del.map(r => r.sup).join(' / ')]);
+      }
     });
+    // Presente en un turno y ausente en el otro: cuenta como presente, pero se avisa
+    const estados = new Set(lista.map(r => r.e));
+    if (turnos.length > 1 && estados.size > 1) {
+      dobles.push([num_(leg), nom, area, sub, turnos.join(' y '),
+        lista.map(r => r.turno + ': ' + (r.e === 'P' ? 'Presente' : 'Ausente')).join(' / '), unir_(lista.map(r => r.sup))]);
+    }
   });
 
   const sinReg = pad.filter(p => !porLeg.has(p[0]) && (turno === 'Ambos' || !p[4] || p[4] === turno));
@@ -407,33 +523,8 @@ function actualizarResumen() {
 
   const t = cuenta_(unidades);
   const totHs = hhee.length ? unidades.reduce((s, u) => s + u.h, 0) : 0;
-  const titFecha = Utilities.formatDate(fv, ss.getSpreadsheetTimeZone(), 'dd/MM/yyyy') +
-    (turno === 'Ambos' ? ', ambos turnos' : ', turno ' + turno);
+  const titFecha = fechaTxt_(fecha) + (turno === 'Ambos' ? ', ambos turnos' : ', turno ' + turno);
 
-  // Escribir
-  h.getRange(2, 1, Math.max(h.getMaxRows() - 1, 1), h.getMaxColumns()).clear();
-  let r = 3;
-  r = bloque_(h, r, 'Totales del ' + titFecha,
-    ['Dotación', 'Presentes', 'Ausentes', 'Sin registrar', '% presentismo', '% ausentismo', 'HHEE (hs)', 'Dobles registros'],
-    [[t.d, t.p, t.a, t.s, t.d ? t.p / t.d : '', t.d ? t.a / t.d : '', totHs, dobles.length]],
-    { pct: [5, 6], dec: [7] });
-  r = bloque_(h, r, 'Por área y sub área',
-    ['Área', 'Sub área', 'Dotación', 'Presentes', 'Ausentes', 'Sin registrar', '% presentismo', 'HHEE (hs)'],
-    filasArea, { pct: [7], dec: [8], negritas: negritas });
-  r = bloque_(h, r, 'Por supervisor',
-    ['Supervisor', 'Dotación', 'Presentes', 'Ausentes', 'Sin registrar', '% presentismo', 'HHEE (hs)'],
-    filasSup, { pct: [6], dec: [7] });
-  r = bloque_(h, r, 'Ausentes (' + ausentes.length + ')',
-    ['Legajo', 'Apellido y nombre', 'Área', 'Sub área', 'Turno', 'Observación', 'Supervisor', 'Tarea'], ausentes, {});
-  r = bloque_(h, r, 'Horas extra (' + String(Math.round(totHs * 10) / 10).replace('.', ',') + ' hs)',
-    ['Legajo', 'Apellido y nombre', 'Área', 'Sub área', 'Turno', 'Observación', 'Supervisor', 'HHEE (hs)'], hhee, { dec: [8] });
-  r = bloque_(h, r, 'Sin registrar (' + filasSin.length + ')',
-    ['Legajo', 'Apellido y nombre', 'Área', 'Sub área', 'Turno en padrón', 'Reporta a', 'Tarea'], filasSin, {});
-  if (dobles.length) {
-    r = bloque_(h, r, 'Dobles registros (' + dobles.length + ')',
-      ['Legajo', 'Apellido y nombre', 'Área', 'Sub área', 'Turno', 'Estados', 'Supervisores'], dobles, {});
-  }
-  h.getRange('H1').setValue(new Date()).setNumberFormat('dd/mm/yyyy hh:mm');
   return { titFecha: titFecha, t: t, totHs: totHs, dobles: dobles, filasArea: filasArea, negritas: negritas,
     filasSup: filasSup, ausentes: ausentes, hhee: hhee, filasSin: filasSin };
 }
@@ -461,7 +552,7 @@ function bloque_(h, r, titulo, cab, filas, o) {
     h.getRange(r, 1).setValue('Sin casos.').setFontColor('#5A6873');
     return r + 2;
   }
-  const datos = filas.map(f => { const x = f.slice(0, cab.length); while (x.length < cab.length) x.push(''); return x; });
+  const datos = filas.map(f => { const x = f.slice(0, cab.length).map(celdaSegura_); while (x.length < cab.length) x.push(''); return x; });
   h.getRange(r, 1, datos.length, cab.length).setValues(datos);
   (o.pct || []).forEach(c => h.getRange(r, c, datos.length, 1).setNumberFormat('0.0%'));
   (o.dec || []).forEach(c => h.getRange(r, c, datos.length, 1).setNumberFormat('0.0'));
@@ -530,6 +621,7 @@ function enviarReporte_() {
   const h = hojaResumen_(ss);
   const dest = destinatarios_(h);
   const d = actualizarResumen();
+  if (!d) throw new Error('El resumen se está actualizando. Probá de nuevo en un minuto.');
   const t = d.t;
   const pct = x => (x === '' || x == null) ? '' : String(Math.round(x * 1000) / 10).replace('.', ',') + ' %';
   const hs = x => String(Math.round((Number(x) || 0) * 10) / 10).replace('.', ',');
@@ -592,4 +684,408 @@ function tablaHtml_(titulo, cab, filas, negritas) {
 
 function escHtml_(v) {
   return String(v == null ? '' : v).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+}
+
+/* ---------------- Listados por período ---------------- */
+
+const H_LIS = 'Listados';
+const TIPOS_LISTADO = ['Por colaborador', 'Detalle', 'Solo ausentes', 'Solo HHEE'];
+const MAX_DIAS_LISTADO = 120;
+const FILA_LISTADO = 7;
+
+function prepararListados_(ss) {
+  let h = ss.getSheetByName(H_LIS);
+  if (!h) {
+    h = ss.insertSheet(H_LIS, 1);
+    const hoy = Utilities.formatDate(new Date(), TZ, 'yyyy-MM-dd');
+    h.getRange('A1:F4').setValues([
+      ['Desde', fechaComoCelda_(hoy.slice(0, 8) + '01'), 'Hasta', fechaComoCelda_(hoy), 'Tipo', 'Por colaborador'],
+      ['Turno', 'Ambos', 'Área', 'Todas', 'Sub área', 'Todas'],
+      ['Tarea', 'Todas', 'Supervisor', 'Todos', '', ''],
+      ['Enviar a', '', '', '', 'Envío', 'Excel adjunto']
+    ]);
+    ['A1', 'C1', 'E1', 'A2', 'C2', 'E2', 'A3', 'C3', 'A4', 'E4'].forEach(a => h.getRange(a).setFontWeight('bold'));
+    ['B1', 'D1', 'F1', 'B2', 'D2', 'F2', 'B3', 'D3', 'B4', 'F4'].forEach(a => h.getRange(a).setBackground('#FCEDD2'));
+    h.getRange('B1').setNumberFormat('dd/mm/yyyy');
+    h.getRange('D1').setNumberFormat('dd/mm/yyyy');
+    h.getRange('B4').setNote('Uno o más correos, separados por coma.');
+    h.setFrozenRows(FILA_LISTADO);
+    [100, 230, 150, 150, 140, 150, 140, 90, 70, 230, 140, 70, 140].forEach((w, i) => h.setColumnWidth(i + 1, w));
+  }
+  const fecha = SpreadsheetApp.newDataValidation().requireDate().setAllowInvalid(false).build();
+  h.getRange('B1').setDataValidation(fecha);
+  h.getRange('D1').setDataValidation(fecha);
+  const lista = (r, xs) => {
+    const v = xs.length <= 500 ? SpreadsheetApp.newDataValidation().requireValueInList(xs, true).setAllowInvalid(true).build() : null;
+    h.getRange(r).setDataValidation(v);
+  };
+  const pad = padron_();
+  const unicos = xs => Array.from(new Set(xs.filter(Boolean))).sort((a, b) => a.localeCompare(b, 'es'));
+  lista('F1', TIPOS_LISTADO);
+  lista('B2', ['Ambos', 'TM', 'TT']);
+  lista('D2', ['Todas'].concat(unicos(pad.map(p => p[2]))));
+  lista('F2', ['Todas'].concat(unicos(pad.map(p => p[3]))));
+  lista('B3', ['Todas'].concat(unicos(pad.map(p => p[6]))));
+  lista('D3', ['Todos'].concat(unicos(pad.map(p => p[5]).concat(supervisores_().map(x => x.nombre)))));
+  lista('F4', ['Excel adjunto', 'Link a Drive']);
+  return h;
+}
+
+// Registros de un rango de fechas (yyyy-MM-dd), leyendo solo los tramos de filas necesarios
+function registrosRango_(desde, hasta) {
+  const h = SpreadsheetApp.getActive().getSheetByName(H_ASIS);
+  if (!h || h.getLastRow() < 2) return [];
+  const ids = h.getRange(2, 1, h.getLastRow() - 1, 1).getDisplayValues();
+  const tramos = [];
+  ids.forEach((r, i) => {
+    const f = String(r[0]).slice(0, 10);
+    if (r[0].length <= 10 || f < desde || f > hasta) return;
+    const fila = i + 2, u = tramos[tramos.length - 1];
+    if (u && fila - u[1] <= 20) u[1] = fila; else tramos.push([fila, fila]);
+  });
+  let vals = [];
+  tramos.forEach(t => { vals = vals.concat(h.getRange(t[0], 1, t[1] - t[0] + 1, COLS_ASIS.length).getDisplayValues()); });
+  return vals.filter(r => { const f = r[0].slice(0, 10); return r[0].length > 10 && f >= desde && f <= hasta; }).map(r => {
+    const id = r[0].split('|');
+    return {
+      fecha: id[0], turno: id[1], leg: id[2], sup: r[10],
+      e: r[7] === 'Ausente' ? 'A' : 'P',
+      h: Number(String(r[8]).replace(',', '.')) || 0,
+      o: r[9], hora: r[11], nom: r[4], area: r[5], sub: r[6], tarea: r[13] || ''
+    };
+  });
+}
+
+// Lee los filtros de la pestaña Listados y arma el listado. Devuelve null si otro proceso está escribiendo.
+function generarListado_() {
+  const ss = SpreadsheetApp.getActive();
+  const h = prepararListados_(ss);
+  const v = h.getRange('A1:F4').getValues();
+  const tzHoja = ss.getSpreadsheetTimeZone();
+  if (!(v[0][1] instanceof Date) || !(v[0][3] instanceof Date)) throw new Error('Completá las fechas Desde (B1) y Hasta (D1).');
+  let desde = Utilities.formatDate(v[0][1], tzHoja, 'yyyy-MM-dd');
+  let hasta = Utilities.formatDate(v[0][3], tzHoja, 'yyyy-MM-dd');
+  if (desde > hasta) { const x = desde; desde = hasta; hasta = x; }
+  const dias = Math.round((Date.parse(hasta) - Date.parse(desde)) / 864e5) + 1;
+  if (dias > MAX_DIAS_LISTADO) throw new Error('El período no puede superar ' + MAX_DIAS_LISTADO + ' días. Partilo en dos listados.');
+
+  const tipo = TIPOS_LISTADO.indexOf(String(v[0][5])) >= 0 ? String(v[0][5]) : 'Por colaborador';
+  const turno = /^(TM|TT)$/.test(String(v[1][1])) ? String(v[1][1]) : 'Ambos';
+  const todo = x => !x || /^tod[oa]s$/i.test(String(x).trim());
+  const f = {
+    area: todo(v[1][3]) ? '' : String(v[1][3]).trim(),
+    sub: todo(v[1][5]) ? '' : String(v[1][5]).trim(),
+    tarea: todo(v[2][1]) ? '' : String(v[2][1]).trim(),
+    sup: todo(v[2][3]) ? '' : String(v[2][3]).trim()
+  };
+  const L = calcularListado_({ desde: desde, hasta: hasta, tipo: tipo, turno: turno, f: f });
+
+  let lock = null;
+  try { lock = LockService.getDocumentLock(); } catch (e) { lock = null; }
+  if (lock && !lock.tryLock(20000)) return null;
+  try {
+    const cab = L.cab, formatos = L.formatos, tipo = L.tipo, filtros = L.filtros;
+    // Volcar en la pestaña
+    h.getRange(FILA_LISTADO, 1, Math.max(h.getMaxRows() - FILA_LISTADO + 1, 1), h.getMaxColumns()).clear();
+    h.getRange(FILA_LISTADO, 1, 1, cab.length).setValues([cab]).setFontWeight('bold').setBackground('#2F4858').setFontColor('#FFFFFF');
+    if (L.filas.length) {
+      h.getRange(FILA_LISTADO + 1, 1, L.filas.length, cab.length).setValues(L.filas);
+      Object.keys(formatos).forEach(c => h.getRange(FILA_LISTADO + 1, Number(c), L.filas.length, 1).setNumberFormat(formatos[c]));
+    }
+    h.getRange('A5').setValue(tipo + ' del ' + fechaTxt_(desde) + ' al ' + fechaTxt_(hasta) + ', ' + filtros + ': ' +
+      L.filas.length + ' filas. Generado el ' + Utilities.formatDate(new Date(), TZ, 'dd/MM/yyyy HH:mm') + '.')
+      .setFontColor('#5A6873');
+    return L;
+  } finally {
+    if (lock) lock.releaseLock();
+  }
+}
+
+// Cálculo de un listado. p = { desde, hasta (yyyy-MM-dd), tipo, turno, f: { area, sub, tarea, sup } }
+function calcularListado_(p) {
+  const desde = p.desde, hasta = p.hasta, tipo = p.tipo, turno = p.turno, f = p.f;
+  const igual = (a, b) => normTxt_(a) === normTxt_(b);
+  const pad = padron_();
+  const pmap = new Map(pad.map(p => [p[0], p]));
+  const datos = (leg, r) => {
+    const p = pmap.get(leg);
+    return p ? { nom: p[1], area: p[2] || 'Sin área', sub: p[3], tarea: p[6], rep: p[5] }
+      : { nom: (r && r.nom) || FUERA, area: FUERA, sub: '', tarea: '', rep: r ? r.sup : '' };
+  };
+  const pasa = d => (!f.area || igual(d.area, f.area)) && (!f.sub || igual(d.sub, f.sub)) &&
+    (!f.tarea || igual(d.tarea, f.tarea)) && (!f.sup || igual(d.rep, f.sup));
+
+  const regs = registrosRango_(desde, hasta).filter(r => turno === 'Ambos' || r.turno === turno);
+  const ordenar = (a, b) => cmpArea_(a.d.area, b.d.area) || String(a.d.nom).localeCompare(String(b.d.nom), 'es');
+  let cab, filas, formatos;
+
+  if (tipo === 'Por colaborador') {
+    const diasToma = new Set(regs.map(r => r.fecha));
+    const porLeg = new Map();
+    regs.forEach(r => { if (!porLeg.has(r.leg)) porLeg.set(r.leg, []); porLeg.get(r.leg).push(r); });
+    const legs = pad.filter(p => turno === 'Ambos' || !p[4] || p[4] === turno).map(p => p[0]);
+    porLeg.forEach((_, leg) => { if (!pmap.has(leg) || legs.indexOf(leg) < 0) legs.push(leg); });
+    const items = [];
+    Array.from(new Set(legs)).forEach(leg => {
+      const lista = porLeg.get(leg) || [];
+      const d = datos(leg, lista[0]);
+      if (!pasa(d)) return;
+      const porDia = {};
+      lista.forEach(r => { (porDia[r.fecha] = porDia[r.fecha] || []).push(r); });
+      let pres = 0, aus = 0, hs = 0;
+      const obs = [];
+      Object.keys(porDia).sort().forEach(fe => {
+        const del = porDia[fe];
+        if (del.some(r => r.e === 'P')) {
+          pres++;
+          const maxTurno = {};
+          del.forEach(r => { if (r.e === 'P') maxTurno[r.turno] = Math.max(maxTurno[r.turno] || 0, r.h); });
+          hs += Object.keys(maxTurno).reduce((a, k) => a + maxTurno[k], 0);
+        } else aus++;
+        const o = unir_(del.map(r => r.o));
+        if (o) obs.push(fe.slice(8, 10) + '/' + fe.slice(5, 7) + ': ' + o);
+      });
+      items.push({ d: d, fila: [num_(leg), d.nom, d.area, d.sub, d.tarea, d.rep, pres, aus,
+        Math.max(diasToma.size - Object.keys(porDia).length, 0), Math.round(hs * 10) / 10, obs.join('; ')] });
+    });
+    items.sort(ordenar);
+    cab = ['Legajo', 'Apellido y nombre', 'Área', 'Sub área', 'Tarea', 'Reporta a', 'Días presente', 'Días ausente',
+      'Días sin registrar', 'HHEE (hs)', 'Observaciones'];
+    filas = items.map(x => x.fila);
+    formatos = { 10: '0.0' };
+  } else {
+    const items = [];
+    regs.forEach(r => {
+      if (tipo === 'Solo ausentes' && r.e !== 'A') return;
+      if (tipo === 'Solo HHEE' && !(r.e === 'P' && r.h > 0)) return;
+      const d = datos(r.leg, r);
+      if (!pasa(d)) return;
+      items.push({ d: d, r: r, fila: [fechaComoCelda_(r.fecha), r.turno, num_(r.leg), d.nom, d.area, d.sub, d.tarea,
+        r.e === 'P' ? 'Presente' : 'Ausente', r.e === 'P' && r.h ? r.h : '', r.o, r.sup, r.hora, d.rep] });
+    });
+    items.sort((a, b) => a.r.fecha.localeCompare(b.r.fecha) || a.r.turno.localeCompare(b.r.turno) || ordenar(a, b));
+    cab = ['Fecha', 'Turno', 'Legajo', 'Apellido y nombre', 'Área', 'Sub área', 'Tarea', 'Estado', 'HHEE (hs)',
+      'Observación', 'Registró', 'Hora', 'Reporta a'];
+    filas = items.map(x => x.fila);
+    formatos = { 1: 'dd/mm/yyyy', 9: '0.0' };
+  }
+
+  const filtros = [turno === 'Ambos' ? 'ambos turnos' : 'turno ' + turno]
+    .concat(f.area ? ['área ' + f.area] : [], f.sub ? ['sub área ' + f.sub] : [],
+      f.tarea ? ['tarea ' + f.tarea] : [], f.sup ? ['supervisor ' + f.sup] : []).join(', ');
+  return { tipo: tipo, desde: desde, hasta: hasta, filtros: filtros, cab: cab, filas: filas.map(x => x.map(celdaSegura_)), formatos: formatos };
+}
+
+function fechaTxt_(iso) { return iso.slice(8, 10) + '/' + iso.slice(5, 7) + '/' + iso.slice(0, 4); }
+
+// Desde el menú
+function generarListado() {
+  const ui = SpreadsheetApp.getUi();
+  try {
+    const L = generarListado_();
+    if (!L) { ui.alert('Hay otro proceso escribiendo en la planilla. Probá de nuevo en un minuto.'); return; }
+    SpreadsheetApp.getActive().setActiveSheet(SpreadsheetApp.getActive().getSheetByName(H_LIS));
+    SpreadsheetApp.getActive().toast(L.filas.length + ' filas.', 'Listado generado', 5);
+  } catch (err) {
+    ui.alert(err.message);
+  }
+}
+
+function enviarListadoPorMail() {
+  const ui = SpreadsheetApp.getUi();
+  const ss = SpreadsheetApp.getActive();
+  const h = prepararListados_(ss);
+  const dest = String(h.getRange('B4').getValue()).split(/[,;\s]+/).map(x => x.trim())
+    .filter(x => /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(x));
+  if (!dest.length) { ui.alert('Escribí al menos un correo en la celda B4 de la hoja Listados.'); return; }
+  const comoLink = String(h.getRange('F4').getValue()) === 'Link a Drive';
+  try {
+    const L = generarListado_();
+    if (!L) { ui.alert('Hay otro proceso escribiendo en la planilla. Probá de nuevo en un minuto.'); return; }
+    const arch = crearArchivoListado_(L);
+    const opciones = {
+      to: dest.join(','),
+      subject: 'Asistencia FBSA: ' + L.tipo.toLowerCase() + ' del ' + fechaTxt_(L.desde) + ' al ' + fechaTxt_(L.hasta),
+      htmlBody: mailListado_(L, comoLink ? arch.url : ''),
+      name: 'Asistencia FBSA'
+    };
+    if (comoLink) dest.forEach(m => { try { arch.file.addViewer(m); } catch (e) { } });
+    else opciones.attachments = [excel_(arch.id, arch.nombre)];
+    MailApp.sendEmail(opciones);
+    ss.toast('Listado enviado a ' + dest.length + ' destinatario(s). Copia guardada en Drive.', 'Asistencia', 6);
+  } catch (err) {
+    ui.alert('No se pudo enviar el listado: ' + err.message);
+  }
+}
+
+// Crea el archivo del listado en la carpeta "Listados de asistencia" de Drive
+function crearArchivoListado_(L) {
+  const nombre = L.tipo.replace(/\s+/g, '_') + '_' + L.desde + '_al_' + L.hasta;
+  const nuevo = SpreadsheetApp.create(nombre);
+  const hoja = nuevo.getSheets()[0];
+  hoja.setName('Listado');
+  hoja.getRange(1, 1, 1, L.cab.length).setValues([L.cab]).setFontWeight('bold').setBackground('#2F4858').setFontColor('#FFFFFF');
+  if (L.filas.length) {
+    hoja.getRange(2, 1, L.filas.length, L.cab.length).setValues(L.filas);
+    Object.keys(L.formatos).forEach(c => hoja.getRange(2, Number(c), L.filas.length, 1).setNumberFormat(L.formatos[c]));
+  }
+  hoja.setFrozenRows(1);
+  hoja.autoResizeColumns(1, L.cab.length);
+  SpreadsheetApp.flush();
+  const file = DriveApp.getFileById(nuevo.getId());
+  file.moveTo(carpetaListados_());
+  return { id: nuevo.getId(), url: nuevo.getUrl(), file: file, nombre: nombre };
+}
+
+function carpetaListados_() {
+  const props = PropertiesService.getScriptProperties();
+  const id = props.getProperty('carpetaListados');
+  if (id) { try { const c = DriveApp.getFolderById(id); if (!c.isTrashed()) return c; } catch (e) { } }
+  const c = DriveApp.createFolder('Listados de asistencia');
+  props.setProperty('carpetaListados', c.getId());
+  return c;
+}
+
+function excel_(id, nombre) {
+  const resp = UrlFetchApp.fetch('https://docs.google.com/spreadsheets/d/' + id + '/export?format=xlsx', {
+    headers: { Authorization: 'Bearer ' + ScriptApp.getOAuthToken() }, muteHttpExceptions: true
+  });
+  if (resp.getResponseCode() !== 200) throw new Error('No se pudo generar el Excel (código ' + resp.getResponseCode() + ').');
+  return resp.getBlob().setName(nombre + '.xlsx');
+}
+
+function mailListado_(L, url) {
+  let resumen = '';
+  if (L.tipo === 'Por colaborador') {
+    const suma = i => L.filas.reduce((a, f) => a + (Number(f[i]) || 0), 0);
+    resumen = '<p style="margin:0 0 12px">' + L.filas.length + ' colaboradores. Días presente: ' + suma(6) +
+      '. Días ausente: ' + suma(7) + '. HHEE: ' + String(Math.round(suma(9) * 10) / 10).replace('.', ',') + ' hs.</p>';
+  } else {
+    resumen = '<p style="margin:0 0 12px">' + L.filas.length + ' registros.</p>';
+  }
+  return '<div style="font-family:Arial,Helvetica,sans-serif;color:#14202A;max-width:640px">' +
+    '<h2 style="margin:0 0 4px;color:#2F4858">' + escHtml_(L.tipo) + '</h2>' +
+    '<p style="margin:0 0 16px;color:#5A6873">Del ' + fechaTxt_(L.desde) + ' al ' + fechaTxt_(L.hasta) + ', ' + escHtml_(L.filtros) + '.</p>' +
+    resumen +
+    (url ? '<p style="margin:20px 0"><a href="' + url + '" style="background:#2F4858;color:#ffffff;padding:11px 18px;' +
+      'text-decoration:none;border-radius:6px;font-weight:bold">Abrir el listado</a></p>'
+      : '<p style="margin:0 0 12px">El listado va adjunto en Excel.</p>') +
+    '<p style="font-size:12px;color:#5A6873">Mensaje automático del sistema de Asistencia en puesto de Frigorífico Bermejo. ' +
+    'Contiene datos personales de uso interno de RR. HH.; no lo reenvíes fuera del área.</p></div>';
+}
+
+/* ---------------- Panel web de RR. HH. (link de la app + ?vista=rrhh) ---------------- */
+
+const H_ANA = 'Analistas';
+
+function analistas_() {
+  const h = SpreadsheetApp.getActive().getSheetByName(H_ANA);
+  if (!h || h.getLastRow() < 2) return [];
+  return h.getRange(2, 1, h.getLastRow() - 1, 4).getDisplayValues()
+    .filter(r => r[1].trim() && !/^no$/i.test(r[3].trim()))
+    .map(r => ({ nombre: r[0].trim() || r[1].trim(), email: r[1].trim().toLowerCase(), pin: r[2].trim() }));
+}
+
+function ingresarRrhh(cred) {
+  const email = String(cred && cred.email || '').trim().toLowerCase();
+  if (!email) throw new Error('SESION: Ingresá tu email y tu PIN.');
+  const cache = CacheService.getScriptCache();
+  const k = 'fallosR_' + Utilities.base64EncodeWebSafe(email).slice(0, 200);
+  const fallos = Number(cache.get(k) || 0);
+  if (fallos >= 5) throw new Error('SESION: Demasiados intentos con PIN incorrecto. Esperá 10 minutos.');
+  const a = analistas_().find(x => x.email === email);
+  if (!a || !a.pin || a.pin !== String(cred.pin || '').trim()) {
+    cache.put(k, String(fallos + 1), 600);
+    throw new Error('SESION: Email o PIN incorrecto.');
+  }
+  cache.remove(k);
+  const props = PropertiesService.getScriptProperties();
+  limpiarSesiones_(props);
+  const token = Utilities.getUuid();
+  props.setProperty('ses_' + token, JSON.stringify({ r: 'rrhh', n: a.email, h: hash_([a.email, a.pin]), c: Date.now() }));
+  return { nombre: a.nombre, token: token };
+}
+
+function validarRrhh_(cred) {
+  const raw = cred && cred.token ? PropertiesService.getScriptProperties().getProperty('ses_' + cred.token) : null;
+  if (!raw) throw new Error('SESION: Tu sesión venció. Ingresá de nuevo.');
+  const ses = JSON.parse(raw);
+  if (ses.r !== 'rrhh') throw new Error('SESION: Este panel es solo para RR. HH.');
+  const a = analistas_().find(x => x.email === ses.n);
+  if (!a) throw new Error('SESION: Tu usuario no está habilitado.');
+  if (hash_([a.email, a.pin]) !== ses.h) throw new Error('SESION: Tu PIN cambió. Ingresá de nuevo.');
+  if (Date.now() - ses.c > DIAS_SESION * 864e5) throw new Error('SESION: Tu sesión venció. Ingresá de nuevo.');
+  return a;
+}
+
+function panelInicio(cred) {
+  const a = validarRrhh_(cred);
+  const pad = padron_();
+  const unicos = xs => Array.from(new Set(xs.filter(Boolean))).sort((x, y) => x.localeCompare(y, 'es'));
+  return {
+    nombre: a.nombre, email: a.email,
+    hoy: Utilities.formatDate(new Date(), TZ, 'yyyy-MM-dd'),
+    tipos: TIPOS_LISTADO, maxDias: MAX_DIAS_LISTADO,
+    // [área, sub área, tarea] de cada persona, para encadenar los filtros en la página
+    combos: unicos(pad.map(p => JSON.stringify([p[2], p[3], p[6]]))).map(x => JSON.parse(x)),
+    supervisores: unicos(pad.map(p => p[5]).concat(supervisores_().map(x => x.nombre)))
+  };
+}
+
+function panelResumen(cred, fecha, turno) {
+  validarRrhh_(cred);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(fecha))) throw new Error('Fecha no válida.');
+  return calcularResumen_(fecha, /^(TM|TT)$/.test(turno) ? turno : 'Ambos');
+}
+
+function paramsWeb_(q) {
+  q = q || {};
+  let desde = String(q.desde || ''), hasta = String(q.hasta || '');
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(desde) || !/^\d{4}-\d{2}-\d{2}$/.test(hasta)) throw new Error('Completá las fechas Desde y Hasta.');
+  if (desde > hasta) { const x = desde; desde = hasta; hasta = x; }
+  if (Math.round((Date.parse(hasta) - Date.parse(desde)) / 864e5) + 1 > MAX_DIAS_LISTADO) {
+    throw new Error('El período no puede superar ' + MAX_DIAS_LISTADO + ' días. Partilo en dos listados.');
+  }
+  const t = x => String(x || '').trim().slice(0, 100);
+  return {
+    desde: desde, hasta: hasta,
+    tipo: TIPOS_LISTADO.indexOf(q.tipo) >= 0 ? q.tipo : 'Por colaborador',
+    turno: /^(TM|TT)$/.test(q.turno) ? q.turno : 'Ambos',
+    f: { area: t(q.area), sub: t(q.sub), tarea: t(q.tarea), sup: t(q.sup) }
+  };
+}
+
+// Las fechas viajan como texto y se quita la marca que evita fórmulas en la hoja
+function filaWeb_(f) {
+  return f.map(v => v instanceof Date ? Utilities.formatDate(v, TZ, 'dd/MM/yyyy')
+    : (typeof v === 'string' && /^'[=+\-@]/.test(v) ? v.slice(1) : v));
+}
+
+function panelListado(cred, q) {
+  validarRrhh_(cred);
+  const L = calcularListado_(paramsWeb_(q));
+  return { tipo: L.tipo, desde: L.desde, hasta: L.hasta, filtros: L.filtros, cab: L.cab,
+    total: L.filas.length, filas: L.filas.slice(0, 500).map(filaWeb_) };
+}
+
+function panelExcel(cred, q) {
+  validarRrhh_(cred);
+  const L = calcularListado_(paramsWeb_(q));
+  const arch = crearArchivoListado_(L);
+  const blob = excel_(arch.id, arch.nombre);
+  return { nombre: arch.nombre + '.xlsx', base64: Utilities.base64Encode(blob.getBytes()) };
+}
+
+function panelMail(cred, q) {
+  const a = validarRrhh_(cred);
+  const L = calcularListado_(paramsWeb_(q));
+  const arch = crearArchivoListado_(L);
+  MailApp.sendEmail({
+    to: a.email,
+    subject: 'Asistencia FBSA: ' + L.tipo.toLowerCase() + ' del ' + fechaTxt_(L.desde) + ' al ' + fechaTxt_(L.hasta),
+    htmlBody: mailListado_(L, ''),
+    attachments: [excel_(arch.id, arch.nombre)],
+    name: 'Asistencia FBSA'
+  });
+  return { email: a.email };
 }

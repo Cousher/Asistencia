@@ -1,0 +1,64 @@
+name: Desplegar en Google Apps Script
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'src/**'
+      - '.github/workflows/deploy.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: apps-script-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Descargar repositorio
+        uses: actions/checkout@v4
+
+      - name: Configurar Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Instalar clasp
+        run: npm install -g @google/clasp
+
+      - name: Preparar credenciales y configuración de clasp
+        env:
+          CLASPRC_JSON: ${{ secrets.CLASPRC_JSON }}
+          SCRIPT_ID: ${{ secrets.SCRIPT_ID }}
+          DEPLOYMENT_ID: ${{ secrets.DEPLOYMENT_ID }}
+        run: |
+          if [ -z "$CLASPRC_JSON" ] || [ -z "$SCRIPT_ID" ] || [ -z "$DEPLOYMENT_ID" ]; then
+            echo "Faltan secrets requeridos (CLASPRC_JSON, SCRIPT_ID, DEPLOYMENT_ID)."
+            exit 1
+          fi
+          printf '%s\n' "$CLASPRC_JSON" > "$HOME/.clasprc.json"
+          chmod 600 "$HOME/.clasprc.json"
+          node -e '
+            const fs = require("fs");
+            fs.writeFileSync(".clasp.json", JSON.stringify({
+              scriptId: process.env.SCRIPT_ID.trim(),
+              rootDir: "src"
+            }, null, 2));
+          '
+
+      - name: Subir código a Google Apps Script
+        run: clasp push --force
+
+      - name: Actualizar implementación web
+        env:
+          DEPLOYMENT_ID: ${{ secrets.DEPLOYMENT_ID }}
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          SHORT_SHA="${COMMIT_SHA:0:7}"
+          clasp deploy --deploymentId "$(printf '%s' "$DEPLOYMENT_ID" | tr -d '[:space:]')" --description "GitHub Actions ($SHORT_SHA)"
+
+      - name: Limpiar credenciales temporales
+        if: always()
+        run: rm -f "$HOME/.clasprc.json" .clasp.json

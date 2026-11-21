@@ -160,7 +160,7 @@ td.leg{font-family:"Barlow Condensed",sans-serif;font-weight:700;font-size:1.05r
       <label class="campo">Supervisor<select id="l-sup"></select></label>
     </div>
     <div class="chips" role="group" aria-label="Período rápido">
-      <button class="chip" data-per="hoy">Hoy</button>
+      <button class="chip" data-per="ayer">Ayer</button>
       <button class="chip" data-per="semana">Esta semana</button>
       <button class="chip" data-per="mes">Este mes</button>
       <button class="chip" data-per="mesant">Mes anterior</button>
@@ -317,13 +317,15 @@ function encadenar(){
 function prepararListados(){
   const tipos=S.ini.tipos;
   $("#l-tipo").innerHTML=tipos.map(t=>'<option value="'+esc(t)+'">'+esc(t)+"</option>").join("");
+  if(tipos.includes("Detalle"))$("#l-tipo").value="Detalle";
   opciones($("#l-sup"),S.ini.supervisores,"","Todos");
   encadenar();
   periodo("mes");
 }
 function periodo(p){
   const h=S.ini?S.ini.hoy:hoy();const d=deIso(h);let a=h,b=h;
-  if(p==="semana"){const dow=(d.getUTCDay()+6)%7;a=iso(new Date(d.getTime()-dow*864e5));}
+  if(p==="ayer"){a=b=iso(new Date(d.getTime()-864e5));}
+  else if(p==="semana"){const dow=(d.getUTCDay()+6)%7;a=iso(new Date(d.getTime()-dow*864e5));}
   else if(p==="mes"){a=h.slice(0,8)+"01";}
   else if(p==="mesant"){const ini=new Date(Date.UTC(d.getUTCFullYear(),d.getUTCMonth()-1,1,12));const fin=new Date(Date.UTC(d.getUTCFullYear(),d.getUTCMonth(),0,12));a=iso(ini);b=iso(fin);}
   $("#l-desde").value=a;$("#l-hasta").value=b;$("#l-desde").max=h;$("#l-hasta").max=h;

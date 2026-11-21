@@ -1,0 +1,8 @@
+.clasp.json
+.clasprc.json
+node_modules/
+*.xlsx
+*.xls
+*.csv
+*.zip
+.DS_Store
